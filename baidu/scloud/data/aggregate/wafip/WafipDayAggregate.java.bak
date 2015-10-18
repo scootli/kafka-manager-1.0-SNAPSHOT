@@ -1,0 +1,360 @@
+package baidu.scloud.data.aggregate.wafip;
+import java.util.ArrayList;
+import java.util.HashMap;
+import java.util.List;
+import java.util.Map;
+import java.util.Vector;
+
+import net.sf.json.JSONArray;
+import org.apache.log4j.Logger;
+
+import baidu.scloud.data.aggregate.base.DayAggregate;
+import baidu.scloud.data.aggregate.base64.Base64;
+import baidu.scloud.data.aggregate.client.PhoenixClient;
+import baidu.scloud.data.aggregate.heap.MinHeap;
+import baidu.scloud.data.aggregate.heap.WafTopIp;
+import baidu.scloud.data.aggregate.utils.IPInfo;
+
+/**
+ * Get top waf ip hour data from hour data table
+ * @param PhoenixClient: the Phoenix operator Client object
+ */
+public class WafipDayAggregate implements DayAggregate{
+	static Logger logger = Logger.getLogger(WafipDayAggregate.class);
+	private static int BATCHUNIT = 1000;
+	private static int DOMAIN_QUERY_LIMIT = 1000;
+	private PhoenixClient phoenixClient;
+	
+	public WafipDayAggregate(org.apache.commons.configuration.PropertiesConfiguration config){
+		phoenixClient = new PhoenixClient(config);
+	}
+	
+	/**
+	 * Get Top Waf ip domain hour data from hour data table. default yesterday
+	 * @param date:
+	 * @param topk: calculate topk waf ip with heap 
+	 * 
+	 * @return execute result status: 0 success >0 failed
+	 */
+	public int summaryDayDomainData(int date,int topk){
+		logger.info("enter wafip domain aggregate");
+		//divide all domain into many parts
+		Vector<String> domainVect = phoenixClient.getDomainByDay("cf_rt_waf_v2",date);
+		if(domainVect.isEmpty()){
+			logger.error("No waf ip domain data. date: " + date);
+			return 1;
+		}
+		int domainLen = domainVect.size();
+		
+		
+		int current = 0;
+		String domain_str = "("; 
+		logger.info("waf ip domain start top ip");
+		while(current < domainLen){
+			int end = (domainLen > (current + DOMAIN_QUERY_LIMIT)?  current + DOMAIN_QUERY_LIMIT: domainLen);
+			for(int index = current;index < end;index++){
+				if(index != end - 1){
+					domain_str += (domainVect.get(index) + ",");
+				}else{
+					domain_str += (domainVect.get(index) + ")");
+				}
+			}
+			//execute topk uri
+			int result = getWafIpByDayDomain(date,topk,domain_str);
+			if(result > 0){
+				return result;
+			}
+			current += DOMAIN_QUERY_LIMIT;
+			domain_str = "(";
+		}
+		
+		logger.info("enter wafip domain aggregate");
+		return 0;
+	}
+	
+	/**
+	 * Get Top Waf ip domain hour data from hour data table. default yesterday
+	 * @param date:
+	 * @param topk:
+	 * 
+	 * @return execute result status: 0 success >0 failed
+	 */
+	public int summaryDaySiteData(int date,int topk){
+		logger.info("enter wafip site aggregate");
+		//divide all domain into many parts
+		Vector<String> domainVect = phoenixClient.getDomainByDay("cf_rt_waf_v2",date);
+		if(domainVect.isEmpty()){
+			logger.error("No waf ip site data. date: " + date);
+			return 1;
+		}
+		int domainLen = domainVect.size();
+		
+		int current = 0;
+		String domain_str = "("; 
+		logger.info("visitor page domain start top uri");
+		while(current < domainLen){
+			int end = (domainLen > (current + DOMAIN_QUERY_LIMIT)?  current + DOMAIN_QUERY_LIMIT: domainLen);
+			for(int index = current;index < end;index++){
+				if(index != end - 1){
+					domain_str += (domainVect.get(index) + ",");
+				}else{
+					domain_str += (domainVect.get(index) + ")");
+				}
+			}
+			//execute topk uri
+			int result = getWafIpByDaySite(date,topk,domain_str);
+			if(result > 0){
+				return result;
+			}
+			current += DOMAIN_QUERY_LIMIT;
+			domain_str = "(";
+		}
+		logger.info("leave wafip site aggregate");
+		return 0;
+	}
+	
+	/**
+	 * Batch execute top waf ip domain
+	 * @param date
+	 * @param topk
+	 * @param domainListStr
+	 * 
+	 * @return execute result status: 0 success >0 failed
+	 */
+	public int getWafIpByDayDomain(int date,int topk,String domainListStr){
+		String whereConds ="domain in " + domainListStr  + " and date=" + date + " group by domain, ip";
+		String projectField = "domain, ip, SUM(attack_count)";
+		Vector<String> wafIpSumDomain = phoenixClient.getExecuteResult("cf_rt_waf_v2",projectField,whereConds);
+		if(wafIpSumDomain.isEmpty()){
+			return 1;
+		}
+		String preDomain = "";
+		String curDomain = "";
+		int current = 0;
+		WafTopIp[] data = new WafTopIp[topk];
+		MinHeap<WafTopIp> heap = null;
+		
+		int count = 0;
+		Vector<String> sqls  = new Vector<String>();
+		
+		//traverse sql result
+		for(String vpData : wafIpSumDomain){
+			String[] topIpArr = vpData.split("-");
+			int len = topIpArr.length;
+			curDomain = topIpArr[0].trim();
+			if(len != 3 || curDomain == ""){
+				continue;
+			}
+			
+			//when saw next domain, write preDomain to phoenix
+			if(!curDomain.equalsIgnoreCase(preDomain)){
+				if(!preDomain.equalsIgnoreCase("")){
+					sqls.add(getInsertWafIpDomainSql(data,preDomain,date,topk,current));
+					count++;
+					if(count >= BATCHUNIT){//execute sql
+						int result = phoenixClient.executeBatch(sqls);
+						if(result > 0){
+							return result;
+						}
+						count = 0;
+						sqls.clear();
+					}
+					data = new WafTopIp[topk];
+					heap = null;
+					current = 0;
+				}
+				preDomain = curDomain;
+			}
+			//Get topk uri with minHeap
+			WafTopIp value = new WafTopIp(Long.parseLong(topIpArr[1].trim()),
+					Long.parseLong(topIpArr[2].trim()));
+			if(current < topk){
+				data[current] = value;
+				if(current == (topk - 1)){
+					//convert min heap
+					heap = new MinHeap<WafTopIp>(data);
+				}
+			}/*else if(current == topk){
+				//convert min heap
+				heap = new MinHeap<WafTopIp>(data);
+			}*/else{
+				//when value great than root, replace the root and retidy the heap
+				WafTopIp root = heap.getRoot();
+				if(root.less_override(value))
+				{
+				    heap.setRoot(value);
+				}
+			}
+			current++;
+		}
+		
+		if(count > 0){
+			//execute last times
+			sqls.add(getInsertWafIpDomainSql(data,curDomain,date,topk,current));
+			int result = phoenixClient.executeBatch(sqls);
+			if(result > 0){
+				return result;
+			}
+		}
+		return 0;
+	}
+	
+	/**
+	 * Batch execute top waf ip site
+	 * @param date
+	 * @param topk
+	 * @param domainListStr
+	 * 
+	 * @return execute result status: 0 success >0 failed
+	 */
+	public int getWafIpByDaySite(int date,int topk,String domainListStr){
+		String whereConds = "domain in " + domainListStr + " and date=" + date + " group by domain,site,ip";
+		String projectField = "domain,site,ip, SUM(attack_count)";
+		Vector<String> wafIpSumDomain = phoenixClient.getExecuteResult("cf_rt_waf_v2",projectField,whereConds);
+		if(wafIpSumDomain.isEmpty()){
+			return 1;
+		}
+		
+		String preDomain = "";
+		String curDomain = "";
+		String preSite = "";
+		String curSite = "";
+		int current = 0;
+		WafTopIp[] data = new WafTopIp[topk];
+		MinHeap<WafTopIp> heap = null;
+		
+		int count = 0;
+		Vector<String> sqls  = new Vector<String>();
+		
+		//traverse sql result
+		for(String vpData : wafIpSumDomain){
+			String[] topIpArr = vpData.split("-");
+			int len = topIpArr.length;
+			curDomain = topIpArr[0].trim();
+			curSite = topIpArr[1].trim();
+			if(len != 4 || curDomain == "" || curSite == ""){
+				continue;
+			}
+			
+			//when saw next domain site, write preDomain preSite to phoenix
+			if(!curDomain.equalsIgnoreCase(preDomain) || !curSite.equalsIgnoreCase(preSite)){
+				if(!preDomain.equalsIgnoreCase("") && !preSite.equalsIgnoreCase("")){
+					sqls.add(getInsertWafIpSiteSql(data,preDomain,preSite,date,topk,current));
+					count++;
+					if(count >= BATCHUNIT){//execute sql
+						int result = phoenixClient.executeBatch(sqls);
+						if(result > 0){
+							return result;
+						}
+						count = 0;
+						sqls.clear();
+					}
+					data = new WafTopIp[topk];
+					heap = null;
+					current = 0;
+				}
+				preDomain = curDomain;
+				preSite = curSite;
+			}
+			//Get topk uri with minHeap
+			WafTopIp value = new WafTopIp(Long.parseLong(topIpArr[2].trim()),
+				Long.parseLong(topIpArr[3].trim()));
+			if(current < topk){
+				data[current] = value;
+				if(current == (topk - 1)){
+					//convert min heap
+					heap = new MinHeap<WafTopIp>(data);
+				}
+			}/*else if(current == topk){
+				//convert min heap
+				heap = new MinHeap<WafTopIp>(data);
+			}*/else{
+				//when value great than root, replace the root and retidy the heap
+				WafTopIp root = heap.getRoot();
+				if(root.less_override(value))
+				{
+				  heap.setRoot(value);
+				}
+			}
+			current++;
+		}
+		
+		if(count > 0){
+			//execute last times
+			sqls.add(getInsertWafIpSiteSql(data,curDomain,curSite,date,topk,current));
+			int result = phoenixClient.executeBatch(sqls);
+			if(result > 0){
+				return result;
+			}
+		}
+		return 0;
+	}
+	
+	/**
+	 * insert waf ip(domain) data into phoenix
+	 * @param data: domain topk waf ip
+	 * @param domain:
+	 * @param date:
+	 * @param topk:
+	 * @param dataLen : data actual size
+	 * 
+	 * @return the insert sql
+	 */
+	public String getInsertWafIpDomainSql(WafTopIp[] data,String domain,int date,int topk,int dataLen){
+		String content = getTopWafIpJsonContent(data,topk,dataLen);
+		String sql = "upsert into cf_rt_summary_waf_ip_of_day_domain values(" + 
+					domain + "," + date + ",'" + content + "')";
+		
+		return sql;
+	}
+	
+	/**
+	 * insert waf ip(site) data into phoenix
+	 * @param data: domain topk waf ip
+	 * @param domain:
+	 * @param site:
+	 * @param date:
+	 * @param topk:
+	 * @param dataLen : data actual size
+	 * 
+	 * @return the insert sql
+	 */
+	public String getInsertWafIpSiteSql(WafTopIp[] data,String domain,String site,int date,int topk,int dataLen){
+		String content = getTopWafIpJsonContent(data,topk,dataLen);
+		String sql = "upsert into cf_rt_summary_waf_ip_of_day_site values(" + 
+					domain + "," + date + "," + site + ",'" + content + "')";
+		
+		return sql;
+	}
+	
+	/**
+	 * Get top waf ip json and base64 result from topk minHeap
+	 * @param data: domain topk waf ip
+	 * @param topk: 
+	 * @param dataLen: data actual size
+	 * 
+	 * @return topk waf ip json and base64 result
+	 */
+	public String getTopWafIpJsonContent(WafTopIp[] data,int topk,int dataLen){
+		long errorIp = 0L;
+		int size = (dataLen > topk)? topk : dataLen;
+		List<Map> list = new ArrayList<Map>();
+		try{
+			for(int index = 0;index < size;index++){
+				Map<String,String> topIp2Count = new HashMap<String,String>();
+				long curIp = data[index].get_ip();
+				errorIp = curIp;
+				topIp2Count.put("ip",curIp + "");
+				topIp2Count.put("sum",data[index].get_attack_count() + "");
+				String region = IPInfo.getIpRegion(curIp);
+				topIp2Count.put("location",region);
+				list.add(topIp2Count);
+			}
+		}catch(Exception ex){
+			logger.error("Get region with ip error. ip is: " + errorIp + " Exception: " + ex);
+		}
+		//JSONArray jsonArray = JSONArray.fromObject(list);
+		String content = JSONArray.fromObject(list).toString();
+		return Base64.getBase64(content);
+	}
+}

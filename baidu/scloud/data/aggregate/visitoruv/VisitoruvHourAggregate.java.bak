@@ -1,0 +1,307 @@
+package baidu.scloud.data.aggregate.visitoruv;
+
+import java.util.Vector;
+
+import org.apache.log4j.Logger;
+
+import baidu.scloud.data.aggregate.base.HourAggregate;
+import baidu.scloud.data.aggregate.client.PhoenixClient;
+import baidu.scloud.data.aggregate.utils.CommonUtils;
+//import baidu.scloud.data.aggregate.utils.UPVData;
+
+/**
+ * Get visitoruv hour data from hour data table
+ * @param PhoenixClient: the Phoenix operator Client object
+ * @param hbaseClient: the hbase operator Client object
+ */
+public class VisitoruvHourAggregate implements HourAggregate{
+	static Logger logger = Logger.getLogger(VisitoruvHourAggregate.class);
+	private PhoenixClient phoenixClient;
+	private static int BATCHUNIT = 1000;
+	private static String CURRENTHOUR = CommonUtils.TimeStamp2Date(System.currentTimeMillis());
+	private static int DOMAIN_QUERY_LIMIT = 1000;
+	
+	public VisitoruvHourAggregate(PhoenixClient phoenix_client){
+		this.phoenixClient = phoenix_client;
+	}
+	
+	/**
+	 * Get visitoruv hour domain data from domian hour data table. default yesterday
+	 * @param date
+	 * @param hour
+	 * 
+	 * @return execute result status: 0 success >0 failed
+	 */
+	public int summaryHourDomainData(int date,int hour){
+		//plan B: hbase coprocessor
+		/*String condition = "date=" + date + " and hour=" + hour + " group by domain,region";
+		String projectField = "domain, region";
+		Vector<String> visitorIpDomain = phoenixClient.getExecuteResult("cf_rt_visitor_uv_v2",projectField,condition);
+		
+		logger.info("Visitor Uv Get domain and region successfully. date: " + date + " hour: " + hour);
+		
+		//HBase coprocessor get domain+date+hour+region ip_num
+		int count = 0;
+		Vector<String> sqls  = new Vector<String>();
+		
+		for(String domainRegion : visitorIpDomain){
+			String[] tmpArray = domainRegion.split("-");
+			String domain = tmpArray[0].trim();
+			String region = tmpArray[1].trim();
+			//logger.info("start Get uv_num and pv_num from cf_rt_visitor_uv_v2 and date=" + date + " hour=" + 
+			//		hour + " domain=" + domain + " region=" + region);
+			UPVData upvNum = hbaseClient.getVisitorUvNum("cf_rt_visitor_uv_v2",domain,date,hour,region,"");
+			//logger.info("end Get uv_num and pv_num from cf_rt_visitor_uv_v2 and date=" + date + " hour=" + 
+			//		hour + " domain=" + domain + " region=" + region);
+			sqls.add(getInsertVisitorUvDomainSql(domain,date,hour,region,upvNum.getUv(),upvNum.getPv()));
+			count++;
+			if(count >= BATCHUNIT){//execute sql
+				phoenixClient.executeBatch(sqls);
+				logger.info("Visitor Uv domain insert phoenix successfully. one sql is: " + sqls.get(0));
+				count = 0;
+				sqls.clear();
+			}
+		}
+		if(count > 0 ){
+			//execute last times
+			phoenixClient.executeBatch(sqls);
+			sqls.clear();
+		}*/
+		
+		logger.info("enter visitoruv domain aggregate");
+		//plan C: divide all domains into many parts
+		Vector<String> domainVect = phoenixClient.getDomainByHour("cf_rt_visitor_uv_v2",date,hour);
+		if(domainVect.isEmpty()){
+			logger.error("No vistitor uv domain data. date: " + date + " hour: " + hour);
+			return 1;
+		}
+		int domainLen = domainVect.size();
+		int current = 0;
+		String domain_str = "(";
+		
+		//batch insert phoenix
+		int count = 0;
+		Vector<String> sqls  = new Vector<String>();
+		
+		logger.info("visitor uv domain start count uv_key pv_num");
+		while(current < domainLen){
+			int end = (domainLen > (current + DOMAIN_QUERY_LIMIT)?  current + DOMAIN_QUERY_LIMIT: domainLen);
+			for(int index = current;index < end;index++){
+				if(index != end - 1){
+					domain_str += (domainVect.get(index) + ",");
+				}else{
+					domain_str += (domainVect.get(index) + ")");
+				}
+			}
+			
+			String condition = "domain in" + domain_str +" and date=" + date + " and hour=" + hour + " group by domain,region";
+			String projectField = "domain, region,count(distinct uv_key),sum(req_pv_count)";
+			Vector<String> visitorIpResult = phoenixClient.getExecuteResult("cf_rt_visitor_uv_v2",projectField,condition);
+			if(visitorIpResult.isEmpty()){
+				return 1;
+			}
+			//write to phoenix
+			for(String uvpResult : visitorIpResult){
+				String[] tmpArray = uvpResult.split("-");
+				String domain = tmpArray[0].trim();
+				String region = tmpArray[1].trim();
+				String uvNum = tmpArray[2].trim();
+				String pvNum = tmpArray[3].trim();
+				sqls.add(getInsertVisitorUvDomainSql(domain,date,hour,region,uvNum,pvNum));
+				count++;
+				if(count >= BATCHUNIT){//execute sql
+					int result =  phoenixClient.executeBatch(sqls);
+					if(result > 0){
+						return result;
+					}
+					//logger.info("Visitor Ip domain insert phoenix successfully. one sql is: " + sqls.get(0));
+					count = 0;
+					sqls.clear();
+				}
+			}
+			
+			current += DOMAIN_QUERY_LIMIT;
+			domain_str = "(";
+		}
+		
+		if(count > 0 ){
+			//execute last times
+			int result = phoenixClient.executeBatch(sqls);
+			if(result > 0){
+				return result;
+			}
+			sqls.clear();
+		}
+		logger.info("leave visitoruv domain aggregate");
+		return 0;
+	}
+	
+	/**
+	 * Get visitoruv hour site data from site hour data table. default yesterday
+	 * @param date
+	 * @param hour
+	 * 
+	 * @return execute result status: 0 success >0 failed
+	 */
+	public int summaryHourSiteData(int date,int hour){
+		//plan B: hbase coprocessor
+		/*String condition = "date=" + date + " and hour=" + hour + " group by domain,site,region";
+		String projectField = "domain, site,region";
+		Vector<String> visitorIpDomain = phoenixClient.getExecuteResult("cf_rt_visitor_uv_v2",projectField,condition);
+		
+		logger.info("Visitor Uv Get domain site and region successfully. date: " + date + " hour: " + hour);
+		
+		//HBase coprocessor get domain+date+hour+region ip_num
+		int count = 0;
+		Vector<String> sqls  = new Vector<String>();
+		
+		for(String domainRegion : visitorIpDomain){
+			String[] tmpArray = domainRegion.split("-");
+			String domain = tmpArray[0].trim();
+			String site = tmpArray[1].trim();
+			String region = tmpArray[2].trim();
+			//logger.info("start Get uv_num and pv_num from cf_rt_visitor_uv_v2 and date=" + date + " hour=" + 
+			//		hour + " domain=" + domain + " region=" + region + " site=" + site);
+			UPVData upvNum = hbaseClient.getVisitorUvNum("cf_rt_visitor_uv_v2",domain,date,hour,region,site);
+			//logger.info("end Get uv_num and pv_num from cf_rt_visitor_uv_v2 and date=" + date + " hour=" + 
+			//		hour + " domain=" + domain + " region=" + region + " site=" + site);
+			sqls.add(getInsertVisitorUvSiteSql(domain,site,date,hour,region,upvNum.getUv(),upvNum.getPv()));
+			count++;
+			if(count >= BATCHUNIT){//execute sql
+				phoenixClient.executeBatch(sqls);
+				logger.info("Visitor Uv site insert phoenix successfully. one sql is: " + sqls.get(0));
+				count = 0;
+				sqls.clear();
+			}
+			
+		}
+		if(count > 0 ){
+			//execute last times
+			phoenixClient.executeBatch(sqls);
+			sqls.clear();
+		}*/
+		
+		logger.info("enter visitoruv site aggregate");
+		//plan C: divide all domains into many parts
+		Vector<String> domainVect = phoenixClient.getDomainByHour("cf_rt_visitor_uv_v2",date,hour);
+		if(domainVect.isEmpty()){
+			logger.error("No vistitor uv site data. date: " + date + " hour: " + hour);
+			return 1;
+		}
+		int domainLen = domainVect.size();
+		int current = 0;
+		String domain_str = "(";
+		
+		//batch insert phoenix
+		int count = 0;
+		Vector<String> sqls  = new Vector<String>();
+		
+		logger.info("visitor uv site start count uv_key pv_num");
+		while(current < domainLen){
+			int end = (domainLen > (current + DOMAIN_QUERY_LIMIT)?  current + DOMAIN_QUERY_LIMIT: domainLen);
+			for(int index = current;index < end;index++){
+				if(index != end - 1){
+					domain_str += (domainVect.get(index) + ",");
+				}else{
+					domain_str += (domainVect.get(index) + ")");
+				}
+			}
+			
+			String condition = "domain in" + domain_str +" and date=" + date + " and hour=" + hour + " group by domain,region,site";
+			String projectField = "domain, region,count(distinct uv_key),sum(req_pv_count),site";
+			Vector<String> visitorIpResult = phoenixClient.getExecuteResult("cf_rt_visitor_uv_v2",projectField,condition);
+			if(visitorIpResult.isEmpty()){
+				return 1;
+			}
+			//write to phoenix
+			for(String uvpResult : visitorIpResult){
+				String[] tmpArray = uvpResult.split("-");
+				String domain = tmpArray[0].trim();
+				String region = tmpArray[1].trim();
+				String uvNum = tmpArray[2].trim();
+				String pvNum = tmpArray[3].trim();
+				String site = tmpArray[4].trim();
+				sqls.add(getInsertVisitorUvSiteSql(domain,site,date,hour,region,uvNum,pvNum));
+				count++;
+				if(count >= BATCHUNIT){//execute sql
+					int result = phoenixClient.executeBatch(sqls);
+					if(result > 0){
+						return result;
+					}
+					//logger.info("Visitor Ip domain insert phoenix successfully. one sql is: " + sqls.get(0));
+					count = 0;
+					sqls.clear();
+				}
+			}
+			
+			current += DOMAIN_QUERY_LIMIT;
+			domain_str = "(";
+		}
+		
+		if(count > 0 ){
+			//execute last times
+			int result = phoenixClient.executeBatch(sqls);
+			if(result > 0){
+				return result;
+			}
+			sqls.clear();
+		}
+		logger.info("leave visitoruv site aggregate");
+		
+		return 0;
+	}
+	
+	/**
+	 * insert visitor Uv(domain) data into phoenix
+	 * @param domain
+	 * @param date
+	 * @param hour
+	 * @param region
+	 * @param uvNum
+	 * @param pvNum
+	 * 
+	 * @return sql :  insert uv domain sql
+	 */
+	public String getInsertVisitorUvDomainSql(String domain,int date,int hour,String region,String uvNum,String pvNum){
+		String insertVal = "";
+		//access aggregating data: from req_hit_num to req_total_bandwidth
+		for(int index = 0;index < 10;index++){
+			insertVal += (0 + ",");
+		}
+		//se_type req_se_num region ip_num pv_num uv_num 
+		insertVal += ("'ALL'" + "," + 0 + "," + "'" + region + "'" + "," + 0 + "," + pvNum + "," + uvNum + ",");
+		//attack_size attack_num domain date hour time
+		insertVal += (0 + "," + 0 + "," + domain + "," + date + "," + hour + "," + CURRENTHOUR);
+		
+		String sql = "upsert into cf_rt_summary_of_hour_domain values(" + insertVal + ")";
+		
+		return sql;
+	}
+	
+	/**
+	 * insert visitor Uv(domain) data into phoenix
+	 * @param domain
+	 * @param site
+	 * @param date
+	 * @param hour
+	 * @param region
+	 * @param uvNum
+	 * @param pvNum
+	 * 
+	 * @return : insert uv site sql
+	 */
+	public String getInsertVisitorUvSiteSql(String domain,String site,int date,int hour,String region,String uvNum,String pvNum){
+		String insertVal = "";
+		//access aggregating data: from req_hit_num to req_total_bandwidth
+		for(int index = 0;index < 10;index++){
+			insertVal += (0 + ",");
+		}
+		//se_type req_se_num region ip_num pv_num uv_num 
+		insertVal += ("'ALL'" + "," + 0 + "," + "'" + region + "'" + "," + 0 + "," + pvNum + "," + uvNum + ",");
+		//attack_size attack_num domain site date hour time 
+		insertVal += (0 + "," + 0 + "," + domain + "," + site + "," + date + "," + hour + "," + CURRENTHOUR);
+		String sql = "upsert into cf_rt_summary_of_hour_site values(" + insertVal + ")";
+		
+		return sql;
+	}
+}
